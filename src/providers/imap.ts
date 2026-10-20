@@ -42,6 +42,19 @@ function parseImapMessageId(raw: string): ImapMessageId {
   return { folder: "INBOX", uid };
 }
 
+interface ReplyHeaders {
+  inReplyTo?: string;
+  references?: string;
+}
+
+/** Extract the unfolded References value from a raw header block fetched via `headers: [...]`. */
+function parseReferencesHeader(raw: Buffer | undefined): string {
+  if (!raw) return "";
+  const unfolded = raw.toString("utf8").replace(/\r?\n[ \t]+/g, " ");
+  const match = unfolded.match(/^references:[ \t]*(.*)$/im);
+  return match ? match[1].trim().replace(/\s+/g, " ") : "";
+}
+
 /**
  * Canonical RFC 3501 system flags. Servers treat flag names case-insensitively
  * but we emit title case for readability and consistency.
@@ -376,8 +389,14 @@ export class ImapProvider implements MailProvider {
   }
 
   async sendMessage(to: string[], subject: string, body: string, options?: SendOptions): Promise<string> {
+    return this.smtpSend(to, subject, body, options);
+  }
+
+  private async smtpSend(to: string[], subject: string, body: string, options?: SendOptions, threading?: ReplyHeaders): Promise<string> {
     const result = await this.smtp.sendMail({
       from: this.email,
+      inReplyTo: threading?.inReplyTo,
+      references: threading?.references,
       to: stripCRLF(to.join(", ")),
       cc: options?.cc ? stripCRLF(options.cc.join(", ")) : undefined,
       bcc: options?.bcc ? stripCRLF(options.bcc.join(", ")) : undefined,
@@ -394,7 +413,34 @@ export class ImapProvider implements MailProvider {
     const to = [replyAddress];
     if (options?.replyAll) { to.push(...original.to, ...original.cc); }
     const subject = ensureReplyPrefix(original.subject);
-    return this.sendMessage(to, subject, body, { cc: options?.cc, bcc: options?.bcc, html: options?.html, attachments: options?.attachments });
+    const threading = await this.resolveReplyHeaders(messageId);
+    return this.smtpSend(to, subject, body, { cc: options?.cc, bcc: options?.bcc, html: options?.html, attachments: options?.attachments }, threading);
+  }
+
+  /**
+   * Build In-Reply-To/References for a reply so clients thread it with the
+   * original. Accepts an IMAP id (`folder:uid`, as returned by search/read)
+   * or a raw RFC 5322 Message-ID (with or without angle brackets).
+   */
+  private async resolveReplyHeaders(ref: string): Promise<ReplyHeaders> {
+    const trimmed = ref.trim();
+    if (/^<[^<>\s]+>$/.test(trimmed)) return { inReplyTo: trimmed, references: trimmed };
+    if (/^[^<>\s:]+@[^<>\s]+$/.test(trimmed)) return { inReplyTo: `<${trimmed}>`, references: `<${trimmed}>` };
+
+    const { folder, uid } = parseImapMessageId(trimmed);
+    const lock = await this.imap.getMailboxLock(folder);
+    try {
+      const meta = await this.imap.fetchOne(uid, {
+        envelope: true, headers: ["references"], uid: true,
+      }, { uid: true });
+      if (!meta) throw new Error(`Message ${ref} not found`);
+      const msgId = meta.envelope?.messageId;
+      if (!msgId) return {};
+      const refs = parseReferencesHeader(meta.headers);
+      return { inReplyTo: msgId, references: refs ? `${refs} ${msgId}` : msgId };
+    } finally {
+      lock.release();
+    }
   }
 
   async forwardMessage(messageId: string, to: string[], options?: ForwardOptions): Promise<string> {
@@ -407,12 +453,17 @@ export class ImapProvider implements MailProvider {
   }
 
   async createDraft(to: string[], subject: string, body: string, options?: DraftOptions): Promise<string> {
+    // Resolve before taking the Drafts lock: the original lives in another
+    // mailbox and imapflow locks are not reentrant.
+    const threading = options?.inReplyTo ? await this.resolveReplyHeaders(options.inReplyTo) : {};
     const raw = buildRawMimeMessage({
       from: this.email,
       to, subject, body,
       cc: options?.cc, bcc: options?.bcc,
       html: options?.html,
       attachments: options?.attachments,
+      inReplyTo: threading.inReplyTo,
+      references: threading.references,
     });
 
     const draftsFolder = await this.findSpecialFolder("\\Drafts");

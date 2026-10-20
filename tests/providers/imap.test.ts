@@ -146,6 +146,53 @@ describe("ImapProvider", () => {
     expect(mockImap.append).toHaveBeenCalledWith("Drafts", expect.any(Buffer), ["\\Draft"]);
   });
 
+  it("createDraft with inReplyTo (IMAP id) sets In-Reply-To and References from the original", async () => {
+    mockImap.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }]);
+    mockImap.fetchOne.mockResolvedValue({
+      uid: 95786,
+      envelope: { messageId: "<orig@mail.example>" },
+      headers: Buffer.from("References: <a@x>\r\n <b@x>\r\n\r\n"),
+    });
+    mockImap.append.mockResolvedValue(undefined);
+
+    await provider.createDraft(["n@x"], "Re: subj", "body", { inReplyTo: "INBOX:95786" });
+    expect(mockImap.fetchOne).toHaveBeenCalledWith(
+      95786, expect.objectContaining({ headers: ["references"] }), { uid: true }
+    );
+    const raw = (mockImap.append.mock.calls[0][1] as Buffer).toString();
+    expect(raw).toContain("In-Reply-To: <orig@mail.example>");
+    expect(raw).toContain("References: <a@x> <b@x> <orig@mail.example>");
+  });
+
+  it("createDraft with inReplyTo as raw Message-ID uses it directly", async () => {
+    mockImap.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }]);
+    mockImap.append.mockResolvedValue(undefined);
+
+    await provider.createDraft(["n@x"], "Re: subj", "body", { inReplyTo: "<563111786951543@mail.yandex.ru>" });
+    expect(mockImap.fetchOne).not.toHaveBeenCalled();
+    const raw = (mockImap.append.mock.calls[0][1] as Buffer).toString();
+    expect(raw).toContain("In-Reply-To: <563111786951543@mail.yandex.ru>");
+    expect(raw).toContain("References: <563111786951543@mail.yandex.ru>");
+  });
+
+  it("replyToMessage sends In-Reply-To and References", async () => {
+    mockImap.fetchOne.mockResolvedValue({
+      uid: 7,
+      envelope: {
+        from: [{ address: "s@x" }], to: [], subject: "Hi", date: new Date(0),
+        messageId: "<orig@x>",
+      },
+      flags: new Set(),
+      bodyStructure: undefined,
+      headers: Buffer.from("\r\n"),
+    });
+
+    await provider.replyToMessage("INBOX:7", "thanks");
+    expect(mockTransport.sendMail).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: "Re: Hi", inReplyTo: "<orig@x>", references: "<orig@x>" })
+    );
+  });
+
   it("createDraft falls back to standard Drafts folder name when no specialUse match", async () => {
     mockImap.list.mockResolvedValue([{ path: "INBOX", specialUse: "\\Inbox" }]);
     mockImap.append.mockResolvedValue(undefined);
