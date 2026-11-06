@@ -132,8 +132,10 @@ async function getProvider(alias: string): Promise<MailProvider> {
       auth: { user: creds.username, pass: creds.password },
     });
 
-    const { ImapProvider } = await import("./providers/imap.js");
-    const provider = new ImapProvider(imap, smtp, config.email);
+    const { ImapProvider, smtpHostSavesSent } = await import("./providers/imap.js");
+    const provider = new ImapProvider(imap, smtp, config.email, {
+      saveSentCopy: config.saveSentCopy ?? !smtpHostSavesSent(config.smtpHost),
+    });
     providerCache.set(alias, provider);
     return provider;
   }

@@ -15,6 +15,11 @@ export interface ImapAccountConfig {
   port: number;
   smtpHost: string;
   smtpPort: number;
+  /**
+   * File a copy of sent mail into the Sent folder. Defaults to true, except
+   * for SMTP services known to do it themselves (Gmail, Outlook/Office 365).
+   */
+  saveSentCopy?: boolean;
 }
 
 export interface JmapAccountConfig {

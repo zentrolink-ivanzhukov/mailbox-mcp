@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import type { ImapFlow } from "imapflow";
-import type { Transporter } from "nodemailer";
+import type { SendMailOptions, Transporter } from "nodemailer";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { stripCRLF } from "../security/validation.js";
 import { buildRawMimeMessage } from "./mime.js";
 import { ensureReplyPrefix, ensureForwardPrefix } from "./headers.js";
@@ -215,6 +217,74 @@ async function readStreamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer
   return Buffer.concat(chunks);
 }
 
+/**
+ * SMTP services that file submitted mail into the Sent folder themselves.
+ * Appending our own copy there would show every message twice.
+ */
+const SERVER_SAVES_SENT_HOSTS = /(^|\.)(gmail\.com|googlemail\.com|office365\.com|outlook\.com)$/i;
+
+export function smtpHostSavesSent(smtpHost: string): boolean {
+  return SERVER_SAVES_SENT_HOSTS.test(smtpHost.trim());
+}
+
+export interface ImapProviderOptions {
+  /**
+   * Append a copy of each message sent over SMTP to the Sent folder, the way
+   * desktop clients do. Plain IMAP servers (Dovecot, mailcow…) never do this
+   * on their own, so without it sent mail is missing from "Sent". Default true.
+   */
+  saveSentCopy?: boolean;
+}
+
+/**
+ * Split a raw message into its header block (latin1, so every byte survives
+ * the round trip whatever the body charset) and the rest, which starts with
+ * the blank separator line and is never re-encoded.
+ */
+function splitRawHeader(raw: Buffer): { head: string; rest: Buffer; eol: string } {
+  const crlf = raw.indexOf("\r\n\r\n");
+  const lf = raw.indexOf("\n\n");
+  const useLf = lf !== -1 && (crlf === -1 || lf < crlf);
+  const idx = useLf ? lf : crlf;
+  const eol = useLf ? "\n" : "\r\n";
+  if (idx === -1) return { head: raw.toString("latin1"), rest: Buffer.alloc(0), eol };
+  return { head: raw.subarray(0, idx).toString("latin1"), rest: raw.subarray(idx), eol };
+}
+
+/** Drop the Bcc field (with folded continuation lines) from a raw message before SMTP submission. */
+export function stripBccHeader(raw: Buffer): Buffer {
+  const { head, rest, eol } = splitRawHeader(raw);
+  const out: string[] = [];
+  let dropping = false;
+  for (const line of head.split(/\r?\n/)) {
+    if (/^[ \t]/.test(line)) {
+      if (!dropping) out.push(line);
+      continue;
+    }
+    dropping = /^bcc[ \t]*:/i.test(line);
+    if (!dropping) out.push(line);
+  }
+  const cleaned = out.join(eol);
+  return cleaned === head ? raw : Buffer.concat([Buffer.from(cleaned, "latin1"), rest]);
+}
+
+/**
+ * Make sure a raw message carries Message-ID and Date (drafts built by
+ * buildRawMimeMessage have neither), so the copy filed into Sent is the same
+ * message the recipients got and replies can thread against it.
+ */
+export function ensureMessageHeaders(raw: Buffer, makeId: () => string): { raw: Buffer; messageId: string } {
+  const { head, eol } = splitRawHeader(raw);
+  const unfolded = head.replace(/\r?\n[ \t]+/g, " ");
+  const found = unfolded.match(/^message-id:[ \t]*(<[^<>\s]+>)/im);
+  const add: string[] = [];
+  const messageId = found?.[1] ?? makeId();
+  if (!found) add.push(`Message-ID: ${messageId}`);
+  if (!/^date[ \t]*:/im.test(unfolded)) add.push(`Date: ${new Date().toUTCString()}`);
+  if (add.length === 0) return { raw, messageId };
+  return { raw: Buffer.concat([Buffer.from(add.join(eol) + eol, "latin1"), raw]), messageId };
+}
+
 export class ImapProvider implements MailProvider {
   readonly type = "imap";
   readonly capabilities: ProviderCapabilities = {
@@ -228,8 +298,42 @@ export class ImapProvider implements MailProvider {
   constructor(
     private imap: ImapFlow,
     private smtp: Transporter,
-    private email: string
+    private email: string,
+    private options: ImapProviderOptions = {}
   ) {}
+
+  private newMessageId(): string {
+    const domain = this.email.split("@")[1] || "localhost";
+    return `<${randomUUID()}@${domain}>`;
+  }
+
+  /**
+   * File a copy of a just-sent message into the Sent folder. The message has
+   * already left, so a failure here must not fail the send: it is reported
+   * as a suffix on the returned id instead. Skips the append when the server
+   * already holds a message with the same Message-ID.
+   */
+  private async storeSentCopy(raw: () => Promise<Buffer>, messageId: string | undefined, date: Date): Promise<string> {
+    if (this.options.saveSentCopy === false) return "";
+    try {
+      const folder = await this.findSpecialFolder("\\Sent");
+      const lock = await this.imap.getMailboxLock(folder);
+      try {
+        if (messageId) {
+          const existing = await this.imap.search({ header: { "message-id": messageId } }, { uid: true });
+          if (existing && existing.length > 0) return "";
+        }
+        await this.imap.append(folder, await raw(), ["\\Seen"], date);
+      } finally {
+        lock.release();
+      }
+      return "";
+    } catch (err: any) {
+      const reason = String(err?.message ?? err);
+      console.error(`Sent copy not saved for ${this.email}: ${reason}`);
+      return ` (sent, but the copy was NOT saved to Sent: ${reason})`;
+    }
+  }
 
   private async findSpecialFolder(specialUse: string): Promise<string> {
     if (this.specialFolderCache.has(specialUse)) {
@@ -393,8 +497,11 @@ export class ImapProvider implements MailProvider {
   }
 
   private async smtpSend(to: string[], subject: string, body: string, options?: SendOptions, threading?: ReplyHeaders): Promise<string> {
-    const result = await this.smtp.sendMail({
+    // Fix Message-ID and Date up front so the Sent copy matches what went out.
+    const mail: SendMailOptions = {
       from: this.email,
+      messageId: this.newMessageId(),
+      date: new Date(),
       inReplyTo: threading?.inReplyTo,
       references: threading?.references,
       to: stripCRLF(to.join(", ")),
@@ -403,8 +510,15 @@ export class ImapProvider implements MailProvider {
       subject: stripCRLF(subject),
       [options?.html ? "html" : "text"]: body,
       attachments: toNodemailerAttachments(options?.attachments),
-    });
-    return result.messageId ?? "";
+    };
+    const result = await this.smtp.sendMail(mail);
+    const id = result.messageId || (mail.messageId as string);
+    const note = await this.storeSentCopy(() => {
+      const node = new MailComposer(mail).compile();
+      node.keepBcc = true; // the sender's own copy shows Bcc, like any mail client
+      return node.build();
+    }, mail.messageId as string, mail.date as Date);
+    return id + note;
   }
 
   async replyToMessage(messageId: string, body: string, options?: ReplyOptions): Promise<string> {
@@ -678,13 +792,18 @@ export class ImapProvider implements MailProvider {
     const to = formatAddresses(envelope?.to);
     const cc = formatAddresses(envelope?.cc);
     const bcc = formatAddresses(envelope?.bcc);
+    const { raw: outgoing, messageId } = ensureMessageHeaders(rawSource, () => this.newMessageId());
+    // Recipients come from the envelope; the Bcc header itself must not go
+    // out, or every recipient sees the blind-copied addresses.
     const result = await this.smtp.sendMail({
       from: stripCRLF(this.email),
       to: stripCRLF(to.join(", ")),
       cc: cc.length ? stripCRLF(cc.join(", ")) : undefined,
       bcc: bcc.length ? stripCRLF(bcc.join(", ")) : undefined,
-      raw: rawSource,
+      raw: stripBccHeader(outgoing),
     });
+
+    const note = await this.storeSentCopy(async () => outgoing, messageId, new Date());
 
     // Remove sent draft from Drafts folder
     const cleanupLock = await this.imap.getMailboxLock(folder);
@@ -694,7 +813,7 @@ export class ImapProvider implements MailProvider {
       cleanupLock.release();
     }
 
-    return result.messageId ?? "";
+    return (result.messageId || messageId) + note;
   }
 
   async countUnreadByLabel(): Promise<UnreadCount[]> {
